@@ -2,7 +2,7 @@ import json
 import os
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -26,14 +26,9 @@ if not WEBHOOK_URL:
 # -------------------------------------------------
 FIXTURES_URL = "https://www.edcapitals.com/25-26-snl-fixtures/"
 HOME_URL = "https://www.edcapitals.com/"
-SCOREBOARD_URL = "https://www.edcapitals.com/tournament/2526-scottish-national-league/regular-season/"
-
 STATE_FILE = "posted.json"
-UK_TZ = ZoneInfo("Europe/London")
 
-PREGAME_WINDOW_HOURS = 24
-DAILY_SCOREBOARD_HOUR = 18
-DAILY_SCOREBOARD_WINDOW_MIN = 5
+UK_TZ = ZoneInfo("Europe/London")
 
 # -------------------------------------------------
 # Regex
@@ -42,8 +37,8 @@ SCORE_PATTERN = re.compile(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b")
 FIXTURE_DT_PATTERN = re.compile(r"\b(\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2})\b")
 
 KNOWN_TEAMS = [
-    "Capitals", "Warriors", "Rockets", "Pirates", "Tigers", "Kestrels",
-    "Wild", "Thunder", "Lynx", "Sharks", "Stars",
+    "Capitals", "Warriors", "Rockets", "Pirates", "Tigers",
+    "Kestrels", "Wild", "Thunder", "Lynx", "Sharks", "Stars",
 ]
 
 # -------------------------------------------------
@@ -60,16 +55,15 @@ def post_to_discord(content: str) -> None:
 
 def load_state() -> Dict:
     if not os.path.exists(STATE_FILE):
-        return {"posted": [], "pregame": [], "scoreboard_daily_date": ""}
+        return {"results": [], "pregame": []}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
     except Exception:
-        return {"posted": [], "pregame": [], "scoreboard_daily_date": ""}
+        return {"results": [], "pregame": []}
 
-    state.setdefault("posted", [])
+    state.setdefault("results", [])
     state.setdefault("pregame", [])
-    state.setdefault("scoreboard_daily_date", "")
     return state
 
 
@@ -85,7 +79,7 @@ def find_teams(text: str) -> List[str]:
     ]
 
 
-def parse_fixture_datetimes(text: str) -> List[datetime]:
+def parse_datetimes(text: str) -> List[datetime]:
     out = []
     for m in FIXTURE_DT_PATTERN.finditer(text):
         try:
@@ -96,9 +90,9 @@ def parse_fixture_datetimes(text: str) -> List[datetime]:
     return out
 
 # -------------------------------------------------
-# Results (final scores)
+# 1) FINAL RESULT POSTING
 # -------------------------------------------------
-def scrape_capitals_results() -> None:
+def post_final_results() -> None:
     try:
         html = requests.get(FIXTURES_URL, timeout=20).text
     except requests.RequestException:
@@ -107,14 +101,14 @@ def scrape_capitals_results() -> None:
     soup = BeautifulSoup(html, "html.parser")
     lines = [norm(x) for x in soup.get_text("\n").split("\n") if x.strip()]
 
-    found = []
+    detected = []
     for i, line in enumerate(lines):
         if "Capitals" not in line:
             continue
 
         window = " ".join(lines[max(0, i - 4): min(len(lines), i + 10)])
-        m = SCORE_PATTERN.search(window)
-        if not m:
+        score = SCORE_PATTERN.search(window)
+        if not score:
             continue
 
         teams = find_teams(window)
@@ -122,36 +116,36 @@ def scrape_capitals_results() -> None:
             continue
 
         opponent = next(t for t in teams if t != "Capitals")
-        s1, s2 = m.group(1), m.group(2)
+        s1, s2 = score.group(1), score.group(2)
 
         msg = (
-            f"🏒 **Edinburgh Capitals — Result**\n"
-            f"Detected result vs **{opponent}**: **{s1}-{s2}**"
+            f"🏒 **Final Score — Edinburgh Capitals**\n"
+            f"vs **{opponent}**\n"
+            f"Result: **{s1}-{s2}**"
         )
 
         match_id = norm(f"{opponent}-{s1}-{s2}-{window[:80]}")
-        found.append({"id": match_id, "msg": msg})
+        detected.append({"id": match_id, "msg": msg})
 
-    if not found:
+    if not detected:
         return
 
-    uniq = {f["id"]: f for f in found}.values()
     state = load_state()
-    posted = set(state["posted"])
+    posted = set(state["results"])
 
-    for f in uniq:
-        if f["id"] in posted:
+    for d in {x["id"]: x for x in detected}.values():
+        if d["id"] in posted:
             continue
-        post_to_discord(f["msg"])
-        posted.add(f["id"])
+        post_to_discord(d["msg"])
+        posted.add(d["id"])
 
-    state["posted"] = sorted(posted)
+    state["results"] = sorted(posted)
     save_state(state)
 
 # -------------------------------------------------
-# Pregame (within 24h)
+# 2) DAY-BEFORE GAME ALERT (T-24h)
 # -------------------------------------------------
-def scrape_next_game() -> Optional[Tuple[datetime, str]]:
+def get_next_capitals_game() -> Optional[Tuple[datetime, str]]:
     try:
         html = requests.get(HOME_URL, timeout=20).text
     except requests.RequestException:
@@ -175,7 +169,7 @@ def scrape_next_game() -> Optional[Tuple[datetime, str]]:
         if SCORE_PATTERN.search(window):
             continue
 
-        dts = [dt for dt in parse_fixture_datetimes(window) if dt > now]
+        dts = [dt for dt in parse_datetimes(window) if dt > now]
         if not dts:
             continue
 
@@ -189,25 +183,28 @@ def scrape_next_game() -> Optional[Tuple[datetime, str]]:
     return min(candidates, key=lambda x: x[0]) if candidates else None
 
 
-def run_pregame() -> None:
-    nxt = scrape_next_game()
+def post_day_before_alert() -> None:
+    nxt = get_next_capitals_game()
     if not nxt:
         return
 
-    dt, opponent = nxt
+    game_dt, opponent = nxt
     now = datetime.now(UK_TZ)
-    if (dt - now).total_seconds() / 3600 > PREGAME_WINDOW_HOURS:
+
+    # Trigger window: between 24h and 23h before face-off
+    delta_hours = (game_dt - now).total_seconds() / 3600
+    if not (23 <= delta_hours <= 25):
         return
 
     state = load_state()
-    pid = f"{dt.isoformat()}|{opponent}"
+    pid = f"{game_dt.isoformat()}|{opponent}"
     if pid in state["pregame"]:
         return
 
     msg = (
-        f"🏒 **Game Day Alert — Edinburgh Capitals**\n"
+        f"🏒 **Game Tomorrow — Edinburgh Capitals**\n"
         f"vs **{opponent}**\n"
-        f"⏰ Face-off: **{dt:%a %d %b %Y, %H:%M}** (UK time)"
+        f"⏰ Face-off: **{game_dt:%a %d %b %Y, %H:%M}** (UK time)"
     )
     post_to_discord(msg)
 
@@ -215,71 +212,9 @@ def run_pregame() -> None:
     save_state(state)
 
 # -------------------------------------------------
-# Daily scoreboard snapshot at 18:00
-# -------------------------------------------------
-def scrape_scoreboard_snapshot() -> Optional[str]:
-    try:
-        html = requests.get(SCOREBOARD_URL, timeout=20).text
-    except requests.RequestException:
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-    lines = [norm(x) for x in soup.get_text("\n").split("\n") if x.strip()]
-
-    if "Latest Scores" not in lines:
-        return None
-
-    start = lines.index("Latest Scores")
-    chunk = lines[start:start + 200]
-
-    items = []
-    for i in range(len(chunk) - 8):
-        window = " ".join(chunk[i:i + 10])
-        m = SCORE_PATTERN.search(window)
-        if not m:
-            continue
-
-        teams = find_teams(window)
-        if len(teams) < 2:
-            continue
-
-        a, b = m.group(1), m.group(2)
-        items.append(f"{teams[0]} {a}-{b} {teams[1]}")
-
-    if not items:
-        return None
-
-    uniq = list(dict.fromkeys(items))[:5]
-    return "🏒 **SNL Scoreboard (Latest Scores)**\n" + "\n".join(f"• {x}" for x in uniq)
-
-
-def run_daily_scoreboard() -> None:
-    now = datetime.now(UK_TZ)
-    if not (now.hour == DAILY_SCOREBOARD_HOUR and now.minute <= DAILY_SCOREBOARD_WINDOW_MIN):
-        return
-
-    state = load_state()
-    today = now.strftime("%Y-%m-%d")
-    if state["scoreboard_daily_date"] == today:
-        return
-
-    msg = scrape_scoreboard_snapshot()
-    if not msg:
-        return
-
-    post_to_discord(msg)
-    state["scoreboard_daily_date"] = today
-    save_state(state)
-
-# -------------------------------------------------
 # Main
 # -------------------------------------------------
 if __name__ == "__main__":
-    logging.info("Edinburgh Capitals SNL bot running")
-    scrape_capitals_results()
-    run_pregame()
-    run_daily_scoreboard()
-
-    logging.info("Starting Edinburgh Capitals SNL Discord Bot...")
-    scrape_capitals_results()
-    run_pregame()
+    logging.info("Edinburgh Capitals Match Bot running")
+    post_day_before_alert()
+    post_final_results()

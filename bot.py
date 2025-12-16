@@ -79,4 +79,4 @@ def scrape_capitals_results():
             "Stars",
         ]
         teams_found = [t for t in known if re.search(rf"\b{re.escape(t)}\b", window)]
-        if "Capitals" not in teams_found or len(teams_found) <
+        if "Capitals" not in teams_found or len(teams_found) < 2:

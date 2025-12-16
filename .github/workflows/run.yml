@@ -1,35 +1,4 @@
-name: Capitals SNL Bot
-
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes
+    - cron: "*/5 * * * *"
   workflow_dispatch:
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run bot
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python bot.py
-
-      - name: Commit updated state
-        run: |
-          git config user.name "capitals-bot"
-          git config user.email "capitals-bot@users.noreply.github.com"
-          git add posted.json
-          git commit -m "Update posted state" || echo "No changes"
-          git push

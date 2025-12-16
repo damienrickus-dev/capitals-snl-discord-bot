@@ -1,84 +1,119 @@
 import json
 import os
 import re
-from datetime import datetime, timezone
-
+import logging
+from datetime import datetime
+from typing import List, Dict
 import requests
 from bs4 import BeautifulSoup
 
-WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Edinburgh Capitals publish SNL fixtures/results on their site.
+# Environment Variables
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+if not WEBHOOK_URL:
+    logging.error("DISCORD_WEBHOOK_URL not set in environment variables.")
+    raise EnvironmentError("DISCORD_WEBHOOK_URL not set in environment variables.")
+
+# Constants
 FIXTURES_URL = "https://www.edcapitals.com/25-26-snl-fixtures/"
-
 STATE_FILE = "posted.json"
 
+# Compile reusable regex patterns
+SCORE_PATTERN = re.compile(r'\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b')
+KNOWN_TEAMS = [
+    "Capitals", "Warriors", "Rockets", "Pirates", "Tigers", "Kestrels",
+    "Wild", "Thunder", "Lynx", "Sharks", "Stars",
+]
 
+# Utility Functions
 def post_to_discord(content: str) -> None:
-    r = requests.post(WEBHOOK_URL, json={"content": content}, timeout=20)
-    r.raise_for_status()
+    try:
+        response = requests.post(WEBHOOK_URL, json={"content": content}, timeout=20)
+        response.raise_for_status()
+        logging.info(f"Successfully posted to Discord: {content}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to post to Discord: {e}")
+        raise
 
-
-def load_state() -> dict:
+def load_state() -> Dict[str, List[str]]:
     if not os.path.exists(STATE_FILE):
+        logging.info("State file not found. Initializing new state.")
         return {"posted": []}
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logging.warning(f"Error loading state file: {e}")
+        return {"posted": []}
 
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
+def save_state(state: Dict[str, List[str]]) -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        logging.info("State saved successfully.")
+    except Exception as e:
+        logging.error(f"Failed to save state: {e}")
+        raise
 
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
-
-def scrape_capitals_results():
+def scrape_capitals_results() -> None:
     """
-    Scrapes the Capitals fixtures page and looks for lines containing a score.
-    This is heuristic-based because the page is not a formal API.
-    It will only post when it detects a clear scoreline containing 'Capitals'.
+    Scrapes the Edinburgh Capitals SNL fixtures page for recent match results.
+    Posts updates to Discord for matches not previously posted.
     """
-    html = requests.get(FIXTURES_URL, timeout=20).text
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Convert page to a clean line list
-    lines = [norm(x) for x in soup.get_text("\n").split("\n")]
-    lines = [x for x in lines if x]
+    try:
+        html = requests.get(FIXTURES_URL, timeout=20).text
+        soup = BeautifulSoup(html, "html.parser")
+        lines = [norm(x) for x in soup.get_text("\n").split("\n") if x.strip()]
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch fixtures: {e}")
+        return
 
     results = []
     for i, line in enumerate(lines):
         if "Capitals" not in line:
             continue
 
-        # Look around the "Capitals" line for a score pattern
+        # Contextual window around the "Capitals" line
         window = " ".join(lines[max(0, i - 4): min(len(lines), i + 10)])
-
-        # Require a simple scoreline like "3 - 2" or "3–2" or "3 2" nearby
-        m = re.search(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b", window)
-        if not m:
+        score_match = SCORE_PATTERN.search(window)
+        if not score_match:
             continue
 
-        a = int(m.group(1))
-        b = int(m.group(2))
+        # Extract scores
+        team_a_score, team_b_score = int(score_match.group(1)), int(score_match.group(2))
+        
+        # Detect teams in the window
+        teams_found = [team for team in KNOWN_TEAMS if re.search(rf"\b{re.escape(team)}\b", window, re.IGNORECASE)]
+        if "Capitals" not in teams_found or len(teams_found) < 2:
+            continue
 
-        # Try to infer opponent from nearby known SNL teams (expand this list anytime)
-        known = [
-            "Capitals",
-            "Warriors",
-            "Rockets",
-            "Pirates",
-            "Tigers",
-            "Kestrels",
-            "Wild",
-            "Thunder",
-            "Lynx",
-            "Sharks",
-            "Stars",
-        ]
-        teams_found = [t for t in known if re.search(rf"\b{re.escape(t)}\b", window)]
+        opponent = next(team for team in teams_found if team != "Capitals")
+        result_description = f"Capitals {team_a_score} - {team_b_score} {opponent}"
+        results.append(result_description)
 
-if "Capitals" not in teams_found or len(teams_found) < 2:
-    continue
+    if not results:
+        logging.info("No new results found.")
+        return
+
+    state = load_state()
+    posted = state.get("posted", [])
+
+    for result in results:
+        if result in posted:
+            logging.debug(f"Result already posted: {result}")
+            continue
+        post_to_discord(result)
+        posted.append(result)
+        logging.info(f"New result posted: {result}")
+
+    state["posted"] = posted
+    save_state(state)
+
+if __name__ == "__main__":
+    logging.info("Starting Capitals SNL Discord Bot...")
+    scrape_capitals_results()
